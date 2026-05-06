@@ -1,15 +1,15 @@
 // app/(tabs)/home.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "expo-router";
 import {
-  Alert,
-  Platform,
   StyleSheet,
   Text,
   View,
   Pressable,
   Switch,
   useWindowDimensions,
+  Animated,
+  ScrollView,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import Icon from "react-native-vector-icons/FontAwesome";
@@ -17,10 +17,19 @@ import Icon from "react-native-vector-icons/FontAwesome";
 import HomeHeader from "../HomeHeader";
 import ModelWebView from "../../src/components/ModelWebView";
 import { API_BASE } from "../../src/config";
+import { useSession } from "../../src/context/SessionContext";
 
 export default function HomePage() {
   const router = useRouter();
   const { width } = useWindowDimensions();
+  const { auth } = useSession();
+
+  const displayName = useMemo(() => {
+    if (auth.status === "loggedInWithProfile" && auth.profile.displayName) {
+      return auth.profile.displayName;
+    }
+    return "there";
+  }, [auth]);
 
   const [visionEnabled, setVisionEnabled] = useState(true);
   const [visionPreviewOn, setVisionPreviewOn] = useState(false);
@@ -36,20 +45,9 @@ export default function HomePage() {
   const goToAccount = () => router.push("/profile");
   const goToNavigate = () => router.push("/search" as any);
   const goToSavedPlaces = () => router.push("/places");
-  const goToCameraVoice = () =>
-    router.push({ pathname: "/camera", params: { mode: "voice" } } as any);
-  const goToCameraOCR = () =>
-    router.push({ pathname: "/camera", params: { mode: "ocr" } } as any);
-
-  const goToScreenReader = () => {
-    const title = "Coming soon";
-    const msg = "Screen Reader is not implemented yet.";
-    if (Platform.OS === "web") {
-      (globalThis as any).alert?.(`${title}\n\n${msg}`);
-    } else {
-      Alert.alert(title, msg);
-    }
-  };
+  const goToEmergency = () => router.push("/emergency" as any);
+  const goToCameraVoice = () => router.push("/camera" as any);
+  const goToCameraOCR = () => router.push("/camera" as any);
 
   useEffect(() => {
     if (!visionEnabled) {
@@ -91,7 +89,7 @@ export default function HomePage() {
     <SafeAreaView style={styles.screen}>
       <View style={[styles.content, { width: contentWidth }]}>
         <HomeHeader
-          greeting="Hi Daniel"
+          greeting={`Hi ${displayName}`}
           appTitle="WalkBuddy"
           onPressProfile={goToAccount}
           showDivider
@@ -99,10 +97,9 @@ export default function HomePage() {
         />
 
         <View style={styles.mainArea}>
-          <Pressable style={styles.searchButton} onPress={goToNavigate}>
-            <Text style={styles.searchText}>SEARCH</Text>
-          </Pressable>
+          <BounceButton label="SEARCH" onPress={goToNavigate} search />
 
+          <BounceButton label="SEARCH" onPress={goToNavigate} search />
           <View style={styles.grid}>
             <ActionTile
               icon="microphone"
@@ -114,10 +111,11 @@ export default function HomePage() {
               label="PLACES"
               onPress={goToSavedPlaces}
             />
+
             <ActionTile
-              icon="volume-up"
-              label="SCREEN READER"
-              onPress={goToScreenReader}
+              icon="exclamation-triangle"
+              label="EMERGENCY"
+              onPress={goToEmergency}
             />
             <ActionTile
               icon="file-text"
@@ -156,7 +154,7 @@ export default function HomePage() {
                 <View style={styles.previewPlaceholder}>
                   <Icon
                     name={visionEnabled ? "eye" : "ban"}
-                    size={28}
+                    size={30}
                     color={tokens.gold}
                   />
                   <Text style={styles.previewText}>VISION PREVIEW</Text>
@@ -165,10 +163,78 @@ export default function HomePage() {
               )}
             </View>
           </Pressable>
-        </View>
-
+        </ScrollView>
       </View>
     </SafeAreaView>
+  );
+}
+
+function BounceButton({
+  label,
+  onPress,
+  search = false,
+}: {
+  label: string;
+  onPress: () => void;
+  search?: boolean;
+}) {
+  const scale = useRef(new Animated.Value(1)).current;
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+
+  const handlePressIn = () => {
+    Animated.parallel([
+      Animated.spring(scale, {
+        toValue: 0.965,
+        useNativeDriver: true,
+        speed: 28,
+        bounciness: 6,
+      }),
+      Animated.timing(overlayOpacity, {
+        toValue: 1,
+        duration: 80,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.parallel([
+      Animated.spring(scale, {
+        toValue: 1,
+        useNativeDriver: true,
+        speed: 22,
+        bounciness: 10,
+      }),
+      Animated.timing(overlayOpacity, {
+        toValue: 0,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+  return (
+    <Pressable
+      onPress={onPress}
+      onPressIn={handlePressIn}
+      onPressOut={handlePressOut}
+    >
+      <Animated.View
+        style={[
+          search ? styles.searchButton : styles.tileInner,
+          { transform: [{ scale }] },
+        ]}
+      >
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            search ? styles.searchPressOverlay : styles.tilePressOverlay,
+            { opacity: overlayOpacity },
+          ]}
+        />
+        <Text style={search ? styles.searchText : styles.tileText}>{label}</Text>
+      </Animated.View>
+    </Pressable>
   );
 }
 
@@ -176,16 +242,75 @@ function ActionTile({
   icon,
   label,
   onPress,
+  centered = false,
 }: {
   icon: string;
   label: string;
   onPress: () => void;
+  centered?: boolean;
 }) {
+  const scale = useRef(new Animated.Value(1)).current;
+  const overlayOpacity = useRef(new Animated.Value(0)).current;
+
+  const handlePressIn = () => {
+    Animated.parallel([
+      Animated.spring(scale, {
+        toValue: 0.96,
+        useNativeDriver: true,
+        speed: 28,
+        bounciness: 6,
+      }),
+      Animated.timing(overlayOpacity, {
+        toValue: 1,
+        duration: 80,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.parallel([
+      Animated.spring(scale, {
+        toValue: 1,
+        useNativeDriver: true,
+        speed: 22,
+        bounciness: 10,
+      }),
+      Animated.timing(overlayOpacity, {
+        toValue: 0,
+        duration: 120,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  };
+
   return (
-    <View style={styles.tile}>
-      <Pressable style={styles.tileInner} onPress={onPress}>
-        <Icon name={icon} size={22} color={tokens.gold} />
-        <Text style={styles.tileText}>{label}</Text>
+    <View style={[styles.tile, centered && styles.tileCentered]}>
+      <Pressable
+        onPress={onPress}
+        onPressIn={handlePressIn}
+        onPressOut={handlePressOut}
+      >
+        <Animated.View
+          style={[
+            styles.tileOuter,
+            { transform: [{ scale }] },
+          ]}
+        >
+          <View style={styles.tileInner}>
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.tilePressOverlay, { opacity: overlayOpacity }]}
+            />
+            <Icon
+              name={icon}
+              size={24}
+              color="#071a2a"
+              style={styles.tileIcon}
+            />
+            <Text style={styles.tileText}>{label}</Text>
+          </View>
+        </Animated.View>
       </Pressable>
     </View>
   );
@@ -194,6 +319,7 @@ function ActionTile({
 const tokens = {
   bg: "#071a2a",
   tile: "#0b0f14",
+  tileInner: "#08131f",
   text: "#e8eef6",
   muted: "#b8c6d4",
   gold: "#f2a900",
@@ -215,56 +341,141 @@ const styles = StyleSheet.create({
   mainArea: {
     flex: 1,
     width: "100%",
-    paddingTop: 8,
+    paddingTop: 10,
+  },
+
+  scrollContent: {
+    paddingBottom: 120,
+  },
+
+  statusCard: {
+    width: "100%",
+    marginBottom: 18,
+  },
+
+  statusTitle: {
+    color: tokens.muted,
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+
+  statusText: {
+    color: tokens.text,
+    fontSize: 13,
+    fontWeight: "700",
+    marginBottom: 2,
+  },
+
+  statusSub: {
+    color: tokens.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginBottom: 8,
+  },
+
+  startButton: {
+    marginTop: 4,
+  },
+
+  startButtonText: {
+    color: tokens.text,
+    fontSize: 13,
+    fontWeight: "800",
   },
 
   searchButton: {
     width: "100%",
-    backgroundColor: tokens.tile,
+    backgroundColor: "#12314a",
     borderWidth: 2,
     borderColor: tokens.gold,
-    borderRadius: 14,
-    paddingVertical: 16,
+    borderRadius: 20,
+    paddingVertical: 20,
     alignItems: "center",
-    marginBottom: 18,
+    justifyContent: "center",
+    marginBottom: 20,
+    overflow: "hidden",
+
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+
+  searchPressOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(255,255,255,0.10)",
   },
 
   searchText: {
     color: tokens.text,
-    fontSize: 16,
-    fontWeight: "800",
-    letterSpacing: 0.5,
+    fontSize: 18,
+    fontWeight: "900",
+    letterSpacing: 0.8,
   },
 
   grid: {
     width: "100%",
     flexDirection: "row",
     flexWrap: "wrap",
-    marginBottom: 20,
+    marginBottom: 22,
   },
 
   tile: {
     width: "50%",
-    padding: 9,
+    padding: 10,
+  },
+
+  tileCentered: {
+    width: "50%",
+  },
+
+  centerRow: {
+    width: "100%",
+    alignItems: "center",
+  },
+
+  tileOuter: {
+    borderWidth: 2,
+    borderColor: tokens.gold,
+    borderRadius: 22,
+
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.18,
+    shadowRadius: 6,
+    elevation: 4,
   },
 
   tileInner: {
     width: "100%",
-    backgroundColor: tokens.tile,
-    borderWidth: 2,
-    borderColor: tokens.gold,
-    borderRadius: 14,
-    paddingVertical: 20, // was 26
+    backgroundColor: tokens.gold,
+    borderRadius: 20,
+    minHeight: 108,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
     alignItems: "center",
     justifyContent: "center",
-    gap: 8, // was 10
+    overflow: "hidden",
+  },
+
+  tilePressOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.08)",
+  },
+
+  tileIcon: {
+    marginBottom: 10,
   },
 
   tileText: {
-    color: tokens.text,
-    fontSize: 12,
+    color: "#071a2a",
+    fontSize: 15,
     fontWeight: "800",
     textAlign: "center",
+    letterSpacing: 0.3,
   },
 
   visionRow: {
@@ -277,9 +488,9 @@ const styles = StyleSheet.create({
 
   visionTitle: {
     color: tokens.text,
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: "900",
-    letterSpacing: 0.4,
+    letterSpacing: 0.5,
   },
 
   visionToggle: {
@@ -296,13 +507,19 @@ const styles = StyleSheet.create({
 
   visionCard: {
     width: "100%",
-    flex: 1,
+    minHeight: 220,
     backgroundColor: tokens.tile,
     borderWidth: 2,
     borderColor: tokens.gold,
-    borderRadius: 14,
+    borderRadius: 18,
     padding: 14,
     marginBottom: 6,
+
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 6,
+    elevation: 4,
   },
 
   visionCardDisabled: {
@@ -310,16 +527,16 @@ const styles = StyleSheet.create({
   },
 
   visionInner: {
-    flex: 1,
+    minHeight: 190,
     borderWidth: 2,
     borderColor: tokens.gold,
-    borderRadius: 12,
+    borderRadius: 16,
     overflow: "hidden",
     backgroundColor: "#0a121a",
   },
 
   previewPlaceholder: {
-    flex: 1,
+    minHeight: 190,
     alignItems: "center",
     justifyContent: "center",
     gap: 8,
@@ -328,7 +545,7 @@ const styles = StyleSheet.create({
 
   previewText: {
     color: tokens.text,
-    fontSize: 13,
+    fontSize: 15,
     fontWeight: "900",
     textAlign: "center",
     letterSpacing: 0.6,
