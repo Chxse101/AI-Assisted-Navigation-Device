@@ -4,12 +4,13 @@ import time
 import tempfile
 import logging
 import anyio
-from fastapi import APIRouter, UploadFile, File, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, UploadFile, File, Request, WebSocket, WebSocketDisconnect, HTTPException
 from opentelemetry import trace
 
 from adapters.vision_adapter import vision_adapter
 from adapters.ocr_adapter import ocr_adapter
 from internal import state
+from internal.motion_tracker import MotionTracker
 from tts_service.message_reasoning import process_adapter_output
 from slow_lane import safe_or_stop_recommendation
 
@@ -18,36 +19,142 @@ router = APIRouter()
 tracer = trace.get_tracer("ai_service")
 
 
+def normalize_vision_events(raw_events):
+    if not isinstance(raw_events, list):
+        return []
+
+    events = []
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+
+        label = event.get("label") or event.get("category")
+        if not label:
+            continue
+
+        try:
+            confidence = float(event.get("confidence", 0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        events.append({
+            "label": str(label),
+            "direction": str(event.get("direction") or "ahead"),
+            "distance_m": event.get("distance_m"),
+            "confidence": confidence,
+        })
+
+    return events
+
+
+def is_current_scene_question(question: str) -> bool:
+    q = question.lower()
+    scene_terms = (
+        "front",
+        "ahead",
+        "around",
+        "near me",
+        "nearby",
+        "surrounding",
+        "surroundings",
+        "see",
+        "seeing",
+        "object",
+        "objects",
+        "obstacle",
+        "obstacles",
+        "danger",
+        "dangerous",
+        "hazard",
+        "hazards",
+    )
+    return any(term in q for term in scene_terms)
+
+
+def current_scene_response(events):
+    if not events:
+        return "I do not detect any clear objects in view right now. Try pointing the camera at the area ahead."
+
+    top_events = sorted(
+        events,
+        key=lambda e: float(e.get("confidence", 0)),
+        reverse=True,
+    )[:3]
+
+    descriptions = []
+    for event in top_events:
+        label = event["label"]
+        direction = event.get("direction") or "ahead"
+        descriptions.append(f"{label} {direction}")
+
+    return "I can see " + ", ".join(descriptions) + "."
+
+
+def _image_dimensions(result: dict) -> tuple[int, int]:
+    shape = result.get("metadata", {}).get("image_shape") or ()
+    if len(shape) >= 2:
+        return int(shape[1]), int(shape[0])
+    return 640, 480
+
+
+def _event_from_detection(detection: dict) -> dict:
+    return {
+        "label": detection["category"],
+        "direction": detection.get("direction", "ahead"),
+        "distance_m": None,
+        "confidence": detection["confidence"],
+        "track_id": detection.get("track_id"),
+        "is_moving": detection.get("is_moving", False),
+        "motion_direction": detection.get("motion_direction", "unknown"),
+        "motion_magnitude": detection.get("motion_magnitude", "low"),
+        "approaching": detection.get("approaching", False),
+    }
+
+
+def _guidance_payload(result: dict, max_messages: int = 1) -> tuple[str, str]:
+    events = [_event_from_detection(d) for d in result["detections"]]
+    safety_message = safe_or_stop_recommendation(events)
+    if safety_message:
+        return safety_message, "CRITICAL"
+
+    image_width, image_height = _image_dimensions(result)
+    msgs = process_adapter_output(result, image_width=image_width, image_height=image_height, max_messages=max_messages)
+    if msgs:
+        return msgs[0].message, msgs[0].risk_level.name
+    return "Path clear", "CLEAR"
+
+
 @router.post("/vision")
 async def vision_endpoint(request: Request, file: UploadFile = File(...)):
+    if not request.app.state.yolo:
+        raise HTTPException(503, "Vision model unavailable")
+
     content = await file.read()
     if not content:
         return {"detections": [], "guidance_message": ""}
 
     temp_path = None
     try:
-        suffix = os.path.splitext(file.filename)[1] or ".jpg"
+        suffix = os.path.splitext(file.filename or "frame.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(content)
             temp_path = f.name
 
-        async with request.app.state.vision_limiter:
-            result = await anyio.to_thread.run_sync(
-                vision_adapter,
-                request.app.state.yolo,
-                temp_path,
-            )
+        try:
+            async with request.app.state.vision_limiter:
+                result = await anyio.to_thread.run_sync(
+                    vision_adapter,
+                    request.app.state.yolo,
+                    temp_path,
+                )
+        except Exception as e:
+            logger.error(f"Vision adapter error: {e}")
+            raise HTTPException(500, "Vision processing failed")
 
         for d in result["detections"]:
-            state.memory.add_event(
-                label=d["category"],
-                direction=d.get("direction", "ahead"),
-                distance_m=None,
-                confidence=d["confidence"],
-            )
+            state.memory.add_event(**_event_from_detection(d))
 
-        msgs = process_adapter_output(result, max_messages=1)
-        guidance = msgs[0].message if msgs else "Path clear"
+        guidance, _risk = _guidance_payload(result, max_messages=1)
 
         return {
             "detections": result["detections"],
@@ -62,22 +169,38 @@ async def vision_endpoint(request: Request, file: UploadFile = File(...)):
 
 @router.post("/ocr")
 async def ocr_endpoint(request: Request, file: UploadFile = File(...)):
+    if not request.app.state.ocr_reader:
+        raise HTTPException(503, "OCR model unavailable")
+
     content = await file.read()
     if not content:
         return {"detections": [], "guidance_message": "Image error"}
 
     temp_path = None
     try:
-        suffix = os.path.splitext(file.filename)[1] or ".jpg"
+        suffix = os.path.splitext(file.filename or "frame.jpg")[1] or ".jpg"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(content)
             temp_path = f.name
 
-        async with request.app.state.ocr_limiter:
-            result = await anyio.to_thread.run_sync(
-                ocr_adapter,
-                request.app.state.ocr_reader,
-                temp_path,
+        try:
+            async with request.app.state.ocr_limiter:
+                result = await anyio.to_thread.run_sync(
+                    ocr_adapter,
+                    request.app.state.ocr_reader,
+                    temp_path,
+                )
+        except Exception as e:
+            logger.error(f"OCR adapter error: {e}")
+            raise HTTPException(500, "OCR processing failed")
+
+        # Store OCR detections to NavigationMemory so the LLM has context
+        for d in result["detections"]:
+            state.memory.add_event(
+                label=f"sign: {d['category']}",
+                direction="ahead",
+                distance_m=None,
+                confidence=d["confidence"],
             )
 
         for d in result["detections"]:
@@ -101,19 +224,58 @@ async def ocr_endpoint(request: Request, file: UploadFile = File(...)):
 
 @router.post("/chat")
 async def chat_endpoint(request: Request, query: dict):
+    start_time = time.monotonic()
     user_q = query.get("query", "").strip()
+    request_events = normalize_vision_events(query.get("vision_events"))
+    memory_events = list(state.memory.buffer)
+    events = request_events or memory_events
+    logger.info(
+        "[Chat] query=%r request_events=%d memory_events=%d",
+        user_q,
+        len(request_events),
+        len(memory_events),
+    )
     if not user_q:
-        return {"response": "I didn't hear a question."}
+        response = "I didn't hear a question."
+        logger.info(
+            "[Chat] source=empty duration_ms=%d response=%r",
+            int((time.monotonic() - start_time) * 1000),
+            response,
+        )
+        return {"response": response}
 
-    events = list(state.memory.buffer)
+    if is_current_scene_question(user_q):
+        response = current_scene_response(request_events)
+        logger.info(
+            "[Chat] source=current_scene request_events=%d memory_events=%d duration_ms=%d response=%r",
+            len(request_events),
+            len(memory_events),
+            int((time.monotonic() - start_time) * 1000),
+            response,
+        )
+        return {"response": response}
+
     hazard = safe_or_stop_recommendation(events[-10:])
     if hazard:
+        logger.info(
+            "[Chat] source=safety_gate events=%d duration_ms=%d response=%r",
+            len(events),
+            int((time.monotonic() - start_time) * 1000),
+            hazard,
+        )
         return {"response": hazard}
 
     if not state.llm_brain:
-        return {"response": "Brain offline."}
+        response = "Brain offline."
+        logger.info(
+            "[Chat] source=offline duration_ms=%d response=%r",
+            int((time.monotonic() - start_time) * 1000),
+            response,
+        )
+        return {"response": response}
 
-    history = list(state.conversation_history)
+    session_id = query.get("session_id", "default")
+    history = list(state.conversation_histories[session_id])
 
     async with request.app.state.llm_limiter:
         response = await anyio.to_thread.run_sync(
@@ -123,10 +285,24 @@ async def chat_endpoint(request: Request, query: dict):
             history,
         )
 
-    state.conversation_history.append({"role": "user", "content": user_q})
-    state.conversation_history.append({"role": "assistant", "content": response})
+    state.conversation_histories[session_id].append({"role": "user", "content": user_q})
+    state.conversation_histories[session_id].append({"role": "assistant", "content": response})
 
+    logger.info(
+        "[Chat] source=llm events=%d duration_ms=%d response=%r",
+        len(events),
+        int((time.monotonic() - start_time) * 1000),
+        response,
+    )
     return {"response": response}
+
+
+@router.post("/chat/clear")
+async def clear_chat_history(query: dict):
+    session_id = query.get("session_id", "default")
+    if session_id in state.conversation_histories:
+        state.conversation_histories[session_id].clear()
+    return {"cleared": True, "session_id": session_id}
 
 
 @router.websocket("/ws/vision")
@@ -160,6 +336,7 @@ async def vision_ws_endpoint(websocket: WebSocket):
         return
 
     limiter = websocket.app.state.vision_limiter
+    tracker = MotionTracker()
     client_host = websocket.client.host if websocket.client else "unknown"
     frames_processed = 0
     total_inference_ms = 0
@@ -227,26 +404,21 @@ async def vision_ws_endpoint(websocket: WebSocket):
                             result = await anyio.to_thread.run_sync(
                                 vision_adapter, yolo, temp_path
                             )
+                            image_width, image_height = _image_dimensions(result)
+                            result["detections"] = tracker.update(
+                                result["detections"],
+                                image_width=image_width,
+                                image_height=image_height,
+                            )
 
                             inference_ms = int((time.monotonic() - t0) * 1000)
                             total_inference_ms += inference_ms
                             frames_processed += 1
 
                             for d in result["detections"]:
-                                state.memory.add_event(
-                                    label=d["category"],
-                                    direction=d.get("direction", "ahead"),
-                                    distance_m=None,
-                                    confidence=d["confidence"],
-                                )
+                                state.memory.add_event(**_event_from_detection(d))
 
-                            msgs = process_adapter_output(result, max_messages=1)
-                            if msgs:
-                                guidance = msgs[0].message
-                                risk_level_str = msgs[0].risk_level.name
-                            else:
-                                guidance = "Path clear"
-                                risk_level_str = "CLEAR"
+                            guidance, risk_level_str = _guidance_payload(result, max_messages=1)
 
                             frame_span.set_attribute("frame.inference_ms", inference_ms)
                             frame_span.set_attribute("frame.detection_count", len(result["detections"]))
